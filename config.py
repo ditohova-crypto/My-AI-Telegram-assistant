@@ -9,10 +9,10 @@ from dotenv import load_dotenv
 # Загрузка переменных окружения из .env
 load_dotenv()
 
-# === TELEGRAM ===
+# === OБЯЗАТЕЛЬНЫЕ НАСТРОЙКИ ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
-# === AI API ===
+# === AI API НАСТРОЙКИ (универсальные) ===
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.moonshot.ai/v1")
 AI_MODEL = os.getenv("AI_MODEL", "kimi-k2.5")
@@ -22,11 +22,11 @@ AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "2048"))
 # === АДМИНИСТРАТОРЫ ===
 ADMIN_USER_IDS = [550553189]
 
-# === ИСТОРИЯ ДИАЛОГА ===
+# === НАСТРОЙКИ ИСТОРИИ ДИАЛОГА ===
 MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
 MAX_MESSAGE_LENGTH = 4000
 
-# === СИСТЕМНЫЙ ПРОМПТ ===
+# === СИСТЕМНЫЕ ИНСТРУКЦИИ ===
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     """Ты — полноценный AI-ассистент на русском языке. Твои ключевые качества:
@@ -49,14 +49,29 @@ SYSTEM_PROMPT = os.getenv(
 Отвечай всегда на языке пользователя (по умолчанию русский)."""
 )
 
+# === BRIEF (ежедневный бриф) ===
+BRIEF_PROMPT = os.getenv(
+    "BRIEF_PROMPT",
+    """Ты — персональный ассистент. На основе истории сообщений пользователя составь краткий утренний бриф:
+
+1. **Ключевые темы вчерашнего дня** — о чём мы говорили
+2. **Незавершённые дела** — что пользователь планировал сделать
+3. **Идеи и инсайты** — полезные мысли из разговоров
+4. **Сегодняшний фокус** — что стоит приоритизировать
+
+Формат: Markdown, структурированный список. Максимум 300 слов.
+Если история пустая — предложи начать с планирования дня."""
+)
+
 # === ПУТИ ===
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / "chat_history.db"
 LOGS_DIR = BASE_DIR / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
-# === ПРОВЕРКА ===
+# === ПРОВЕРКА КОНФИГУРАЦИИ ===
 def validate_config():
+    """Проверяет обязательные настройки перед запуском."""
     errors = []
     if not TELEGRAM_BOT_TOKEN:
         errors.append("TELEGRAM_BOT_TOKEN не указан. Добавьте в .env или переменные окружения.")
