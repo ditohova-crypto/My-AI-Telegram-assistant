@@ -1,69 +1,150 @@
 """
-Конфигурация Telegram-бота AI Assistant
+Webhook-версия для Render.com
 """
 import os
-from pathlib import Path
-from dotenv import load_dotenv
+import logging
+import sys
+from contextlib import asynccontextmanager
 
-load_dotenv()
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-AI_API_KEY = os.getenv("AI_API_KEY", "")
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.moonshot.ai/v1")
-AI_MODEL = os.getenv("AI_MODEL", "kimi-k2.5")
-AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "1"))
-AI_MAX_TOKENS = int(os.getenv("AI_MAX_TOKENS", "2048"))
-
-ADMIN_USER_IDS = [550553189]
-
-MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "20"))
-MAX_MESSAGE_LENGTH = 4000
-
-SYSTEM_PROMPT = os.getenv(
-    "SYSTEM_PROMPT",
-    """Ты — полноценный AI-ассистент на русском языке. Твои ключевые качества:
-1. Профессионализм: точные ответы с объяснением логики.
-2. Дружелюбие: уважительно, с теплотой, без фамильярности.
-3. Контекстность: помнишь историю разговора.
-4. Структура: маркдаун-списки, параграфы, жирный/курсив.
-5. Инициативность: уточняешь детали вместо догадок.
-6. Безопасность: не помогаешь в незаконной деятельности.
-7. Краткость: по существу, без воды.
-
-Форматирование Telegram:
-- Жирный: **текст**
-- Курсив: *текст*
-- Код: `код`
-- Блок кода: ```язык\\nкод\\n```
-- Списки: - или 1. 2. 3.
-
-Отвечай на языке пользователя (по умолчанию русский)."""
+# Настройка логирования ДО всех импортов
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
+logger = logging.getLogger(__name__)
 
-BRIEF_PROMPT = os.getenv(
-    "BRIEF_PROMPT",
-    """Ты — персональный ассистент. На основе истории сообщений пользователя составь краткий утренний бриф:
-1. Ключевые темы вчерашнего дня
-2. Незавершённые дела
-3. Идеи и инсайты
-4. Сегодняшний фокус
-Формат: Markdown, максимум 300 слов."""
-)
+# Ленивые импорты — только когда нужно
+_ptb_app = None
 
-BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
+WEBHOOK_PATH = "/telegram-webhook"
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me-in-render-env")
 
-BASE_DIR = Path(__file__).parent
-# === ГЛАВНОЕ ИСПРАВЛЕНИЕ ДЛЯ RENDER ===
-# Persistent Disk на Render примонтирован к /app/data
-DB_PATH = Path("/app/data/chat_history.db")
-LOGS_DIR = BASE_DIR / "logs"
-# НЕ создаём папки здесь — делаем это безопасно в bot.py
+RENDER_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+if RENDER_HOST:
+    WEBHOOK_URL = f"https://{RENDER_HOST}{WEBHOOK_PATH}"
+else:
+    WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
 
-def validate_config():
-    errors = []
-    if not TELEGRAM_BOT_TOKEN:
-        errors.append("TELEGRAM_BOT_TOKEN не указан.")
-    if not AI_API_KEY:
-        errors.append("AI_API_KEY не указан.")
-    if errors:
-        raise ValueError("\n".join(errors))
+logger.info("ENV: RENDER_HOST=%s, WEBHOOK_URL=%s", RENDER_HOST, WEBHOOK_URL)
+
+
+def _get_bot_app():
+    """Ленивая инициализация PTB приложения."""
+    global _ptb_app
+    if _ptb_app is None:
+        logger.info("Инициализация bot.py...")
+        import bot as bot_module
+        _ptb_app = bot_module.create_application()
+        logger.info("bot.py инициализирован.")
+    return _ptb_app
+
+
+# === APScheduler для напоминаний и брифов ===
+async def _check_reminders_job():
+    try:
+        import bot as bot_module
+        ptb = _get_bot_app()
+        await bot_module.check_and_send_reminders(ptb)
+    except Exception as e:
+        logger.error("Ошибка напоминаний: %s", e)
+
+
+async def _check_briefs_job():
+    try:
+        import bot as bot_module
+        ptb = _get_bot_app()
+        await bot_module.check_and_send_briefs(ptb)
+    except Exception as e:
+        logger.error("Ошибка брифов: %s", e)
+
+
+# === Lifespan: старт/стоп приложения ===
+@asynccontextmanager
+async def lifespan(app):
+    logger.info("=== СТАРТ приложения ===")
+    
+    # Инициализация PTB
+    ptb = _get_bot_app()
+    await ptb.initialize()
+    await ptb.start()
+    logger.info("PTB запущен.")
+    
+    # Установка webhook
+    if WEBHOOK_URL:
+        try:
+            from telegram import Update
+            await ptb.bot.set_webhook(
+                url=WEBHOOK_URL,
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=Update.ALL_TYPES
+            )
+            logger.info("Webhook установлен: %s", WEBHOOK_URL)
+        except Exception as e:
+            logger.warning("Webhook авто: %s", e)
+    
+    # APScheduler
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(_check_reminders_job, "cron", minute="*", id="reminders", replace_existing=True)
+    scheduler.add_job(_check_briefs_job, "cron", minute="0,10,20,30,40,50", id="briefs", replace_existing=True)
+    scheduler.start()
+    logger.info("Планировщик запущен.")
+    
+    yield
+    
+    # Остановка
+    logger.info("=== ОСТАНОВКА ===")
+    scheduler.shutdown(wait=False)
+    try:
+        await ptb.stop()
+        await ptb.shutdown()
+        await ptb.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+
+# === FastAPI приложение ===
+from fastapi import FastAPI, Request, status
+from telegram import Update
+
+fastapi_app = FastAPI(title="AI Telegram Bot", lifespan=lifespan)
+
+
+@fastapi_app.post(WEBHOOK_PATH)
+async def telegram_webhook(request: Request):
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if secret and secret != WEBHOOK_SECRET:
+        return {"detail": "Unauthorized"}, status.HTTP_401_UNAUTHORIZED
+    data = await request.json()
+    ptb = _get_bot_app()
+    update = Update.de_json(data, ptb.bot)
+    await ptb.process_update(update)
+    return {"ok": True}
+
+
+@fastapi_app.get("/health")
+async def health_check():
+    return {"status": "ok", "webhook_url": WEBHOOK_URL or "not configured"}
+
+
+@fastapi_app.get("/")
+async def root():
+    return {
+        "message": "AI Bot",
+        "health": "/health",
+        "setup_webhook": "/setup-webhook",
+        "webhook_path": WEBHOOK_PATH
+    }
+
+
+@fastapi_app.get("/setup-webhook")
+async def setup_webhook_manual():
+    if not WEBHOOK_URL:
+        return {"ok": False, "error": "WEBHOOK_URL не определён."}
+    try:
+        ptb = _get_bot_app()
+        await ptb.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET, allowed_updates=Update.ALL_TYPES)
+        return {"ok": True, "message": "Webhook установлен!"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
