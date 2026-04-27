@@ -1,5 +1,5 @@
 """
-Telegram-бот: AI-ассистент с сохранением истории диалога.
+Telegram-бот: AI-ассистент.
 """
 import asyncio
 import logging
@@ -19,41 +19,21 @@ from telegram.ext import (
 from openai import AsyncOpenAI, APIError, RateLimitError
 
 from config import (
-    TELEGRAM_BOT_TOKEN,
-    AI_API_KEY,
-    AI_BASE_URL,
-    AI_MODEL,
-    AI_TEMPERATURE,
-    AI_MAX_TOKENS,
-    MAX_MESSAGE_LENGTH,
-    ADMIN_USER_IDS,
-    SYSTEM_PROMPT,
-    BRIEF_PROMPT,
-    LOGS_DIR,
+    TELEGRAM_BOT_TOKEN, AI_API_KEY, AI_BASE_URL, AI_MODEL,
+    AI_TEMPERATURE, AI_MAX_TOKENS, MAX_MESSAGE_LENGTH,
+    ADMIN_USER_IDS, SYSTEM_PROMPT, BRIEF_PROMPT, LOGS_DIR,
     validate_config,
 )
 from database import (
-    init_db,
-    save_message,
-    get_user_history,
-    clear_user_history,
-    update_user_info,
-    get_user_stats,
-    get_all_users_count,
-    cleanup_old_history,
-    add_reminder,
-    get_pending_reminders,
-    mark_reminder_sent,
-    get_user_reminders,
-    cancel_reminder,
-    set_daily_brief,
-    get_daily_briefs_due,
-    mark_brief_sent,
-    get_user_brief_settings,
+    init_db, save_message, get_user_history, clear_user_history,
+    update_user_info, get_user_stats, get_all_users_count, cleanup_old_history,
+    add_reminder, get_pending_reminders, mark_reminder_sent,
+    get_user_reminders, cancel_reminder,
+    set_daily_brief, get_daily_briefs_due, mark_brief_sent, get_user_brief_settings,
     get_full_user_history,
 )
+from search import search_web
 
-# Логирование (безопасно для Render)
 handlers = [logging.StreamHandler(sys.stdout)]
 try:
     LOGS_DIR.mkdir(exist_ok=True)
@@ -97,23 +77,25 @@ def split_long_message(text: str, max_length: int = MAX_MESSAGE_LENGTH) -> list[
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    welcome_text = (
+    welcome = (
         f"👋 Привет, {user.first_name}!\n\n"
         f"Я — AI-ассистент с долгой памятью.\n"
         f"• Отвечаю на вопросы\n"
         f"• Помню контекст разговора\n"
+        f"• Ищу в интернете\n"
         f"• Напоминания и утренние брифы\n\n"
         f"📌 **Команды:**\n"
         f"/start — запуск\n"
         f"/clear — очистить историю\n"
+        f"/search <запрос> — поиск в интернете\n"
         f"/remind 14:30 Позвонить маме\n"
-        f"/listreminders — мои напоминания\n"
+        f"/listreminders — напоминания\n"
         f"/setbrief вкл 09:00 — утренний бриф\n"
         f"/brief — бриф сейчас\n"
         f"/status — статистика\n"
         f"/help — справка"
     )
-    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(welcome, parse_mode=ParseMode.MARKDOWN)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
@@ -122,22 +104,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "• /start — начать\n"
         "• /clear, /newtopic — очистить историю\n"
         "• /status — статистика\n"
+        "• /search <запрос> — поиск в интернете\n"
         "• /remind ЧЧ:ММ Текст — напоминание\n"
-        "• /listreminders — список напоминаний\n"
+        "• /listreminders — список\n"
         "• /cancelreminder ID — отменить\n"
-        "• /setbrief вкл 09:00 — ежедневный бриф\n"
-        "• /brief — получить бриф сейчас\n"
+        "• /setbrief вкл 09:00 — бриф\n"
+        "• /brief — получить сейчас\n"
         "• /help — справка\n\n"
         "Просто пишите — я помню контекст!"
     )
     await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    deleted = clear_user_history(user_id)
-    msg = "🧹 История очищена!"
-    if deleted > 0:
-        msg += f"\n(Удалено: {deleted})"
+    deleted = clear_user_history(update.effective_user.id)
+    msg = "🧹 История очищена!" + (f"\n(Удалено: {deleted})" if deleted else "")
     await update.message.reply_text(msg)
 
 async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -145,8 +125,7 @@ async def newtopic_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text("✨ Новая тема!")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    stats = get_user_stats(user_id)
+    stats = get_user_stats(update.effective_user.id)
     if stats:
         text = (
             f"📊 **Статистика:**\n\n"
@@ -160,37 +139,40 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         text = f"📊 Пока нет статистики.\n\nМодель: `{AI_MODEL}`"
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Поиск в интернете через Brave Search."""
+    if not context.args:
+        await update.message.reply_text(
+            "🔍 Использование: `/search запрос`\nПример: `/search последние новости ИИ`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    query = " ".join(context.args)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    result = search_web(query, count=5)
+    for part in split_long_message(result):
+        await update.message.reply_text(part, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
 async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Нет прав.")
         return
-    total_users = get_all_users_count()
-    await update.message.reply_text(
-        f"🔐 **Админ**\n• Пользователей: *{total_users}*\n• Модель: `{AI_MODEL}`",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    total = get_all_users_count()
+    await update.message.reply_text(f"🔐 **Админ**\n• Пользователей: *{total}*\n• Модель: `{AI_MODEL}`", parse_mode=ParseMode.MARKDOWN)
 
 async def admin_cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Нет прав.")
         return
     days = int(context.args[0]) if context.args and context.args[0].isdigit() else 30
     deleted = cleanup_old_history(days)
-    await update.message.reply_text(
-        f"🗑️ Удалено сообщений старше {days} дней: *{deleted}*",
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await update.message.reply_text(f"🗑️ Удалено сообщений старше {days} дней: *{deleted}*", parse_mode=ParseMode.MARKDOWN)
 
 async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     if not context.args or len(context.args) < 2:
-        await update.message.reply_text(
-            "⏰ `/remind ЧЧ:ММ Текст`\nПример: `/remind 14:30 Позвонить маме`",
-            parse_mode=ParseMode.MARKDOWN
-        )
+        await update.message.reply_text("⏰ `/remind ЧЧ:ММ Текст`\nПример: `/remind 14:30 Позвонить маме`", parse_mode=ParseMode.MARKDOWN)
         return
     time_str = context.args[0]
     text = " ".join(context.args[1:])
@@ -200,20 +182,16 @@ async def remind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         remind_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         if remind_at <= now:
             remind_at += timedelta(days=1)
-        reminder_id = add_reminder(user_id, chat_id, text, remind_at)
-        if reminder_id > 0:
-            await update.message.reply_text(
-                f"✅ Напоминание!\n📅 *{remind_at.strftime('%d.%m.%Y %H:%M')}*\n📝 {text}",
-                parse_mode=ParseMode.MARKDOWN
-            )
+        rid = add_reminder(user_id, chat_id, text, remind_at)
+        if rid > 0:
+            await update.message.reply_text(f"✅ Напоминание!\n📅 *{remind_at.strftime('%d.%m.%Y %H:%M')}*\n📝 {text}", parse_mode=ParseMode.MARKDOWN)
         else:
             await update.message.reply_text("❌ Ошибка.")
     except ValueError:
         await update.message.reply_text("❌ Формат: `ЧЧ:ММ`")
 
 async def list_reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    reminders = get_user_reminders(user_id)
+    reminders = get_user_reminders(update.effective_user.id)
     if not reminders:
         await update.message.reply_text("📭 Нет напоминаний.")
         return
@@ -225,11 +203,10 @@ async def list_reminders_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def cancel_reminder_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text("❌ `/cancelreminder ID`")
         return
-    if cancel_reminder(user_id, int(context.args[0])):
+    if cancel_reminder(update.effective_user.id, int(context.args[0])):
         await update.message.reply_text("✅ Отменено.")
     else:
         await update.message.reply_text("❌ Не найдено.")
@@ -268,20 +245,15 @@ async def brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not history:
         await update.message.reply_text("📭 Нет истории для брифа.")
         return
-    history_text = "\n".join([
-        f"[{h['created_at']}] {h['role']}: {h['content'][:200]}"
-        for h in history[:30]
-    ])
+    history_text = "\n".join([f"[{h['created_at']}] {h['role']}: {h['content'][:200]}" for h in history[:30]])
     messages = [
         {"role": "system", "content": BRIEF_PROMPT},
         {"role": "user", "content": f"История:\n{history_text}\n\nСоставь бриф."}
     ]
     try:
         response = await client.chat.completions.create(
-            model=AI_MODEL,
-            messages=messages,
-            temperature=AI_TEMPERATURE,
-            max_tokens=AI_MAX_TOKENS,
+            model=AI_MODEL, messages=messages,
+            temperature=AI_TEMPERATURE, max_tokens=AI_MAX_TOKENS,
         )
         brief = response.choices[0].message.content.strip()
         for part in split_long_message(brief):
@@ -293,6 +265,7 @@ async def brief_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def check_and_send_reminders(app: Application) -> None:
     now = datetime.now()
     reminders = get_pending_reminders(now)
+    logger.info("Напоминаний к отправке: %d", len(reminders))
     for r in reminders:
         try:
             text = f"⏰ *Напоминание!*\n\n{r['text']}"
@@ -302,8 +275,10 @@ async def check_and_send_reminders(app: Application) -> None:
             logger.error("Ошибка напоминания: %s", e)
 
 async def check_and_send_briefs(app: Application) -> None:
-    now = datetime.now()
+    # Время сервера UTC, у пользователя Москва UTC+3 → добавляем 3 часа
+    now = datetime.now() + timedelta(hours=3)
     briefs = get_daily_briefs_due(now)
+    logger.info("Брифов к отправке: %d", len(briefs))
     for b in briefs:
         try:
             user_id = b["user_id"]
@@ -311,19 +286,14 @@ async def check_and_send_briefs(app: Application) -> None:
             history = get_full_user_history(user_id, limit=50)
             if not history:
                 continue
-            history_text = "\n".join([
-                f"[{h['created_at']}] {h['role']}: {h['content'][:200]}"
-                for h in history[:30]
-            ])
+            history_text = "\n".join([f"[{h['created_at']}] {h['role']}: {h['content'][:200]}" for h in history[:30]])
             messages = [
                 {"role": "system", "content": BRIEF_PROMPT},
                 {"role": "user", "content": f"История:\n{history_text}\n\nСоставь бриф."}
             ]
             response = await client.chat.completions.create(
-                model=AI_MODEL,
-                messages=messages,
-                temperature=AI_TEMPERATURE,
-                max_tokens=AI_MAX_TOKENS,
+                model=AI_MODEL, messages=messages,
+                temperature=AI_TEMPERATURE, max_tokens=AI_MAX_TOKENS,
             )
             brief = response.choices[0].message.content.strip()
             await app.bot.send_message(
@@ -339,32 +309,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not update.message or not update.message.text:
         return
     user = update.effective_user
-    user_message = update.message.text.strip()
-    user_id = user.id
-    logger.info("Сообщение от id=%s: %s...", user_id, user_message[:50])
-    save_message(user_id, "user", user_message)
+    msg = update.message.text.strip()
+    logger.info("Сообщение от id=%s: %s...", user.id, msg[:50])
+    save_message(user.id, "user", msg)
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     try:
-        history = get_user_history(user_id)
+        history = get_user_history(user.id)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         messages.extend(history)
         response = await client.chat.completions.create(
-            model=AI_MODEL,
-            messages=messages,
-            temperature=AI_TEMPERATURE,
-            max_tokens=AI_MAX_TOKENS,
+            model=AI_MODEL, messages=messages,
+            temperature=AI_TEMPERATURE, max_tokens=AI_MAX_TOKENS,
         )
-        assistant_message = response.choices[0].message.content.strip()
-        save_message(user_id, "assistant", assistant_message)
-        tokens_used = response.usage.total_tokens if response.usage else 0
-        update_user_info(
-            user_id=user_id,
-            username=user.username,
-            first_name=user.first_name,
-            last_name=user.last_name,
-            tokens_used=tokens_used
-        )
-        for idx, part in enumerate(split_long_message(assistant_message)):
+        answer = response.choices[0].message.content.strip()
+        save_message(user.id, "assistant", answer)
+        tokens = response.usage.total_tokens if response.usage else 0
+        update_user_info(user.id, user.username, user.first_name, user.last_name, tokens)
+        for idx, part in enumerate(split_long_message(answer)):
             if idx > 0:
                 await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
                 await asyncio.sleep(0.5)
@@ -372,13 +333,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except RateLimitError:
         await update.message.reply_text("⚠️ Слишком много запросов. Подождите.")
     except APIError as e:
-        error_msg = str(e)
-        if "insufficient_quota" in error_msg or "billing" in error_msg.lower():
+        err = str(e)
+        if "insufficient_quota" in err or "billing" in err.lower():
             await update.message.reply_text("💳 Закончился баланс API.")
-        elif "invalid_api_key" in error_msg.lower():
+        elif "invalid_api_key" in err.lower():
             await update.message.reply_text("🔑 Неверный API-ключ.")
         else:
-            await update.message.reply_text(f"⚠️ Ошибка API.\n\n`{error_msg[:200]}`", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"⚠️ Ошибка API.\n\n`{err[:200]}`", parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         logger.error("Ошибка: %s", e, exc_info=True)
         await update.message.reply_text("😔 Ошибка. Попробуйте позже.")
@@ -403,22 +364,23 @@ def create_application() -> Application:
         raise RuntimeError(f"Конфигурация неверна: {e}") from e
     init_db()
     init_openai_client()
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("clear", clear_command))
-    application.add_handler(CommandHandler("newtopic", newtopic_command))
-    application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("admin_stats", admin_stats_command))
-    application.add_handler(CommandHandler("admin_cleanup", admin_cleanup_command))
-    application.add_handler(CommandHandler("remind", remind_command))
-    application.add_handler(CommandHandler("listreminders", list_reminders_command))
-    application.add_handler(CommandHandler("cancelreminder", cancel_reminder_command))
-    application.add_handler(CommandHandler("setbrief", set_brief_command))
-    application.add_handler(CommandHandler("brief", brief_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_error_handler(error_handler)
-    return application
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("clear", clear_command))
+    app.add_handler(CommandHandler("newtopic", newtopic_command))
+    app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("search", search_command))
+    app.add_handler(CommandHandler("admin_stats", admin_stats_command))
+    app.add_handler(CommandHandler("admin_cleanup", admin_cleanup_command))
+    app.add_handler(CommandHandler("remind", remind_command))
+    app.add_handler(CommandHandler("listreminders", list_reminders_command))
+    app.add_handler(CommandHandler("cancelreminder", cancel_reminder_command))
+    app.add_handler(CommandHandler("setbrief", set_brief_command))
+    app.add_handler(CommandHandler("brief", brief_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
+    return app
 
 def main() -> None:
     application = create_application()
