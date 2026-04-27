@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.log
+*.db
+.env
+logs/
+.DS_Store
+Dockerfile
